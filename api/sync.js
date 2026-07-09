@@ -10,13 +10,13 @@ export default async function handler(req, res) {
     const cwUsername = 'PGUS';
     const cwPassword = 'XMJoa7/xbEOUTnBGwa+nXD/w';
 
-    // Salesforce Dev Org Credentials
-    const sfTokenUrl = 'https://fslsecondarydemo-dev-ed.develop.my.salesforce.com/services/oauth2/token';
-    const sfRestUrl = 'https://fslsecondarydemo-dev-ed.develop.my.salesforce.com/services/data/v60.0/sobjects/ContentVersion';
-    const sfClientId = '3MVG9Gm6vbdjgMWRlURdLXMlIG_tgrmt5KpI.I4ma2uUHYz1EiXkGUM8ZQ7ekpP5co9tMdXIKcaLrQ0H7aivR';
-    const sfClientSecret = '8B2C63D9643A65D05B954C1A9AD717485F3D87308865BC036D6665E6F6E53C1C';
+    // Salesforce Partial Sandbox Org Credentials
+    const sfTokenUrl = 'https://sourcedirectimports--partial.sandbox.my.salesforce.com/services/oauth2/token';
+    const sfRestUrl = 'https://sourcedirectimports--partial.sandbox.my.salesforce.com/services/data/v60.0/sobjects/ContentVersion';
+    const sfClientId = '3MVG9WCdh6PFin0i79xoaBNqM3kscnTJo0CzkSnBUjbpsGZ5HndBicDai2qxeolOnMjKRBx4f0XxSxIY9_fzG';
+    const sfClientSecret = '2044E3DDBC028C89A20C0DA0E9323F2498A1657B42D96608B02ACE4F15281A45';
 
-    // 3. Extract inputs from Postman/Salesforce
+    // 3. Extract inputs from Salesforce LWC Button payload
     const { cwKey, salesforceId } = req.body;
     if (!cwKey || !salesforceId) {
         return res.status(400).json({ error: 'Missing cwKey or salesforceId in JSON body.' });
@@ -77,46 +77,62 @@ export default async function handler(req, res) {
         }
         const cwXmlText = await cwResponse.text();
 
-        // --- 6. EXTRACT BASE64 DATA FAST (String Slicing) ---
-        const startTag = '<ImageData>';
-        const endTag = '</ImageData>';
-        const startPos = cwXmlText.indexOf(startTag);
-        
-        if (startPos === -1) {
-            throw new Error(`No ImageData found in CargoWise response for Key: ${cwKey}`);
+        // --- 6. PARSE MULTIPLE DOCUMENTS USING REGEX ---
+        const documentRegex = /<Document>([\s\S]*?)<\/Document>/g;
+        const uploadPromises = [];
+        let match;
+
+        while ((match = documentRegex.exec(cwXmlText)) !== null) {
+            const documentBlock = match[1];
+
+            // Extract FileName dynamically or create a fallback name
+            const nameMatch = documentBlock.match(/<FileName>(.*?)<\/FileName>/);
+            const fileName = nameMatch ? nameMatch[1] : `CW_Doc_${cwKey}_${Date.now()}.pdf`;
+
+            // Extract ImageData Base64 binary string stringently
+            const dataMatch = documentBlock.match(/<ImageData>(.*?)<\/ImageData>/);
+            if (!dataMatch) continue; // Skip if this block happens to lack image data
+            const base64Data = dataMatch[1];
+
+            // Prepare individual Salesforce Payload
+            const sfPayload = {
+                Title: fileName,
+                PathOnClient: fileName,
+                VersionData: base64Data,
+                FirstPublishLocationId: salesforceId
+            };
+
+            // Queue up the asynchronous network task without waiting yet
+            const uploadTask = fetch(sfRestUrl, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${accessToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(sfPayload)
+            }).then(async (res) => {
+                const data = await res.json();
+                if (!res.ok) throw new Error(`Failed uploading ${fileName}: ${JSON.stringify(data)}`);
+                return { fileName, contentVersionId: data.id, status: 'Success' };
+            }).catch(err => ({ fileName, status: 'Failed', error: err.message }));
+
+            uploadPromises.push(uploadTask);
         }
-        
-        const exactStart = startPos + startTag.length;
-        const exactEnd = cwXmlText.indexOf(endTag, exactStart);
-        const base64Data = cwXmlText.substring(exactStart, exactEnd);
 
-        // --- 7. PUSH DIRECTLY TO SALESFORCE REST API ---
-        const sfPayload = {
-            Title: `CW_Document_${cwKey}.pdf`,
-            PathOnClient: `CW_Document_${cwKey}.pdf`,
-            VersionData: base64Data,
-            FirstPublishLocationId: salesforceId
-        };
-
-        const sfUploadResponse = await fetch(sfRestUrl, {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${accessToken}`,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify(sfPayload)
-        });
-
-        const sfUploadData = await sfUploadResponse.json();
-
-        if (!sfUploadResponse.ok) {
-            throw new Error(`Salesforce Upload Failed: ${JSON.stringify(sfUploadData)}`);
+        // Return error if zero file segments were parsed out
+        if (uploadPromises.length === 0) {
+            return res.status(404).json({ error: `No valid ImageData files discovered in CargoWise for shipment reference: ${cwKey}` });
         }
 
-        // --- 8. RETURN SUCCESS ---
+        // --- 7. EXECUTE STREAM UPLOADS CONCURRENTLY TO SALESFORCE ---
+        // Pushes all files simultaneously using Promise.all to bypass transactional timeout windows
+        const results = await Promise.all(uploadPromises);
+
+        // --- 8. RETURN BATCH RESPONSE TO LWC ---
         return res.status(201).json({ 
             success: true, 
-            contentVersionId: sfUploadData.id 
+            totalFilesProcessed: results.length,
+            files: results
         });
 
     } catch (error) {
