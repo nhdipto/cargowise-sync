@@ -1,22 +1,31 @@
 export default async function handler(req, res) {
-    // 1. Enforce POST requests only
+    // --- 1. HANDLE CORS HANDSHAKE FOR BROWSER SECURITY ---
+    res.setHeader('Access-Control-Allow-Credentials', true);
+    res.setHeader('Access-Control-Allow-Origin', '*'); // Allows all origins, or replace '*' with your specific sandbox domain
+    res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
+    res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version, Authorization');
+
+    // Handle the browser's automatic preflight check (OPTIONS request)
+    if (req.method === 'OPTIONS') {
+        return res.status(200).end();
+    }
+
+    // Enforce POST requests for the actual data run
     if (req.method !== 'POST') {
         return res.status(405).json({ error: 'Method Not Allowed. Please use POST.' });
     }
 
     // 2. CONFIGURATION 
-    // CargoWise eAdaptor Credentials
     const cwEndpoint = 'https://pgutrnservices.wisegrid.net/eAdaptor';
     const cwUsername = 'PGUS';
     const cwPassword = 'XMJoa7/xbEOUTnBGwa+nXD/w';
 
-    // Salesforce Partial Sandbox Org Credentials
     const sfTokenUrl = 'https://sourcedirectimports--partial.sandbox.my.salesforce.com/services/oauth2/token';
     const sfRestUrl = 'https://sourcedirectimports--partial.sandbox.my.salesforce.com/services/data/v60.0/sobjects/ContentVersion';
     const sfClientId = '3MVG9WCdh6PFin0i79xoaBNqM3kscnTJo0CzkSnBUjbpsGZ5HndBicDai2qxeolOnMjKRBx4f0XxSxIY9_fzG';
     const sfClientSecret = '2044E3DDBC028C89A20C0DA0E9323F2498A1657B42D96608B02ACE4F15281A45';
 
-    // 3. Extract inputs from Salesforce LWC Button payload
+    // 3. Extract inputs from payload
     const { cwKey, salesforceId } = req.body;
     if (!cwKey || !salesforceId) {
         return res.status(400).json({ error: 'Missing cwKey or salesforceId in JSON body.' });
@@ -60,7 +69,6 @@ export default async function handler(req, res) {
                 </DocumentRequest>
             </UniversalDocumentRequest>`;
 
-        // Convert Username:Password to Base64 for Basic Auth
         const cwAuthHeader = 'Basic ' + Buffer.from(`${cwUsername}:${cwPassword}`).toString('base64');
         
         const cwResponse = await fetch(cwEndpoint, {
@@ -85,16 +93,13 @@ export default async function handler(req, res) {
         while ((match = documentRegex.exec(cwXmlText)) !== null) {
             const documentBlock = match[1];
 
-            // Extract FileName dynamically or create a fallback name
             const nameMatch = documentBlock.match(/<FileName>(.*?)<\/FileName>/);
             const fileName = nameMatch ? nameMatch[1] : `CW_Doc_${cwKey}_${Date.now()}.pdf`;
 
-            // Extract ImageData Base64 binary string stringently
             const dataMatch = documentBlock.match(/<ImageData>(.*?)<\/ImageData>/);
-            if (!dataMatch) continue; // Skip if this block happens to lack image data
+            if (!dataMatch) continue;
             const base64Data = dataMatch[1];
 
-            // Prepare individual Salesforce Payload
             const sfPayload = {
                 Title: fileName,
                 PathOnClient: fileName,
@@ -102,7 +107,6 @@ export default async function handler(req, res) {
                 FirstPublishLocationId: salesforceId
             };
 
-            // Queue up the asynchronous network task without waiting yet
             const uploadTask = fetch(sfRestUrl, {
                 method: 'POST',
                 headers: {
@@ -119,13 +123,11 @@ export default async function handler(req, res) {
             uploadPromises.push(uploadTask);
         }
 
-        // Return error if zero file segments were parsed out
         if (uploadPromises.length === 0) {
             return res.status(404).json({ error: `No valid ImageData files discovered in CargoWise for shipment reference: ${cwKey}` });
         }
 
         // --- 7. EXECUTE STREAM UPLOADS CONCURRENTLY TO SALESFORCE ---
-        // Pushes all files simultaneously using Promise.all to bypass transactional timeout windows
         const results = await Promise.all(uploadPromises);
 
         // --- 8. RETURN BATCH RESPONSE TO LWC ---
