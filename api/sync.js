@@ -51,7 +51,7 @@ export default async function handler(req, res) {
         }
         const accessToken = authData.access_token;
 
-        // --- 5. FETCH LIVE DATA FROM CARGOWISE ---
+// --- 5. FETCH LIVE DATA FROM CARGOWISE (UPDATED TO EDOCS STREAM ENVELOPE) ---
         const cwXmlRequest = `<?xml version="1.0" encoding="utf-8"?>
             <UniversalDocumentRequest xmlns="http://www.cargowise.com/Schemas/Universal/2011/11" version="1.1">
                 <DocumentRequest>
@@ -66,6 +66,7 @@ export default async function handler(req, res) {
                         <EnterpriseID>PGU</EnterpriseID>
                         <ServerID>TRN</ServerID>
                     </DataContext>
+                    <DocumentTypeCollection Content="Complete" />
                 </DocumentRequest>
             </UniversalDocumentRequest>`;
 
