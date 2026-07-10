@@ -20,6 +20,7 @@ export default async function handler(req, res) {
 
     const sfTokenUrl = 'https://sourcedirectimports--partial.sandbox.my.salesforce.com/services/oauth2/token';
     const sfRestUrl = 'https://sourcedirectimports--partial.sandbox.my.salesforce.com/services/data/v60.0/sobjects/ContentVersion';
+    const sfQueryUrl = 'https://sourcedirectimports--partial.sandbox.my.salesforce.com/services/data/v60.0/query';
     const sfClientId = '3MVG9WCdh6PFin0i79xoaBNqM3kscnTJo0CzkSnBUjbpsGZ5HndBicDai2qxeolOnMjKRBx4f0XxSxIY9_fzG';
     const sfClientSecret = '2044E3DDBC028C89A20C0DA0E9323F2498A1657B42D96608B02ACE4F15281A45';
 
@@ -48,6 +49,18 @@ export default async function handler(req, res) {
             throw new Error('Salesforce Auth Failed: ' + JSON.stringify(authData));
         }
         const accessToken = authData.access_token;
+
+        // --- 4b. FETCH CURRENTLY ATTACHED FILES FOR DEDUPLICATION ---
+        // Pull titles of files already attached to this record to prevent double uploads
+        const soqlQuery = `SELECT Title FROM ContentVersion WHERE FirstPublishLocationId = '${salesforceId}' AND IsLatest = true`;
+        const queryResponse = await fetch(`${sfQueryUrl}?q=${encodeURIComponent(soqlQuery)}`, {
+            method: 'GET',
+            headers: { 'Authorization': `Bearer ${accessToken}` }
+        });
+        const queryData = await queryResponse.json();
+        const existingFileNames = new Set(
+            (queryData.records || []).map(record => record.Title.toLowerCase())
+        );
 
         // --- 5. FETCH LIVE DATA FROM CARGOWISE ---
         const cwXmlRequest = `<?xml version="1.0" encoding="utf-8"?>
@@ -89,7 +102,6 @@ export default async function handler(req, res) {
         const cwXmlText = await cwResponse.text();
 
         // --- 6. GLOBAL IMAGE DATA EXTRACTION ENGINE ---
-        // Match any variation of <...ImageData>...</...ImageData> ignoring namespaces
         const imageDataRegex = /<[^:>]*?ImageData>([\s\S]*?)<\/[^:>]*?ImageData>/g;
         const uploadPromises = [];
         let match;
@@ -99,26 +111,29 @@ export default async function handler(req, res) {
             const base64Data = match[1].trim();
             if (!base64Data) continue;
 
-            // Search back 5000 characters from this ImageData chunk to locate its corresponding FileName tag
             const searchWindowStart = Math.max(0, match.index - 5000);
             const contextChunk = cwXmlText.substring(searchWindowStart, match.index);
             
-            // Extract the closest matching file name from the context window
             const nameMatch = contextChunk.match(/<[^:>]*?FileName>([^<]*?)<\/[^:>]*?FileName>/g);
             let fileName = '';
             
             if (nameMatch && nameMatch.length > 0) {
-                // Grab the raw text value inside the last discovered FileName tag
                 const lastRawTag = nameMatch[nameMatch.length - 1];
                 fileName = lastRawTag.replace(/<[^>]*?>/g, '').trim();
             }
 
-            // Fallback naming convention if parsing failed
             if (!fileName) {
                 fileName = `CargoWise_Attachment_${fileIndex}_${cwKey}.pdf`;
             }
 
             fileIndex++;
+
+            // --- 6b. CRITICAL DEDUPLICATION CHECK ---
+            if (existingFileNames.has(fileName.toLowerCase())) {
+                // Skip uploading this file since an asset with the exact name is already linked
+                uploadPromises.push(Promise.resolve({ fileName, status: 'Skipped (Duplicate)' }));
+                continue;
+            }
 
             const sfPayload = {
                 Title: fileName,
@@ -150,9 +165,12 @@ export default async function handler(req, res) {
         // --- 7. CONCURRENTLY UPLOAD DATA STREAMS TO SALESFORCE ---
         const results = await Promise.all(uploadPromises);
 
+        // Filter total processed files count to reflect only fresh uploads
+        const actualUploadsCount = results.filter(f => f.status === 'Success').length;
+
         return res.status(201).json({ 
             success: true, 
-            totalFilesProcessed: results.length,
+            totalFilesProcessed: actualUploadsCount,
             files: results
         });
 
