@@ -1,16 +1,14 @@
 export default async function handler(req, res) {
     // --- 1. HANDLE CORS HANDSHAKE FOR BROWSER SECURITY ---
     res.setHeader('Access-Control-Allow-Credentials', true);
-    res.setHeader('Access-Control-Allow-Origin', '*'); // Allows all origins, or replace '*' with your specific sandbox domain
+    res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
     res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version, Authorization');
 
-    // Handle the browser's automatic preflight check (OPTIONS request)
     if (req.method === 'OPTIONS') {
         return res.status(200).end();
     }
 
-    // Enforce POST requests for the actual data run
     if (req.method !== 'POST') {
         return res.status(405).json({ error: 'Method Not Allowed. Please use POST.' });
     }
@@ -51,7 +49,7 @@ export default async function handler(req, res) {
         }
         const accessToken = authData.access_token;
 
-// --- 5. FETCH LIVE DATA FROM CARGOWISE (UPDATED TO EDOCS STREAM ENVELOPE) ---
+        // --- 5. FETCH LIVE DATA FROM CARGOWISE ---
         const cwXmlRequest = `<?xml version="1.0" encoding="utf-8"?>
             <UniversalDocumentRequest xmlns="http://www.cargowise.com/Schemas/Universal/2011/11" version="1.1">
                 <DocumentRequest>
@@ -66,7 +64,11 @@ export default async function handler(req, res) {
                         <EnterpriseID>PGU</EnterpriseID>
                         <ServerID>TRN</ServerID>
                     </DataContext>
-                    <DocumentTypeCollection Content="Complete" />
+                    <DocumentTypeCollection Content="Complete">
+                        <DocumentType>
+                            <IncludeUnapprovedDocuments>true</IncludeUnapprovedDocuments>
+                        </DocumentType>
+                    </DocumentTypeCollection>
                 </DocumentRequest>
             </UniversalDocumentRequest>`;
 
@@ -86,20 +88,37 @@ export default async function handler(req, res) {
         }
         const cwXmlText = await cwResponse.text();
 
-        // --- 6. PARSE MULTIPLE DOCUMENTS USING REGEX ---
-        const documentRegex = /<Document>([\s\S]*?)<\/Document>/g;
+        // --- 6. GLOBAL IMAGE DATA EXTRACTION ENGINE ---
+        // Match any variation of <...ImageData>...</...ImageData> ignoring namespaces
+        const imageDataRegex = /<[^:>]*?ImageData>([\s\S]*?)<\/[^:>]*?ImageData>/g;
         const uploadPromises = [];
         let match;
+        let fileIndex = 1;
 
-        while ((match = documentRegex.exec(cwXmlText)) !== null) {
-            const documentBlock = match[1];
+        while ((match = imageDataRegex.exec(cwXmlText)) !== null) {
+            const base64Data = match[1].trim();
+            if (!base64Data) continue;
 
-            const nameMatch = documentBlock.match(/<FileName>(.*?)<\/FileName>/);
-            const fileName = nameMatch ? nameMatch[1] : `CW_Doc_${cwKey}_${Date.now()}.pdf`;
+            // Search back 5000 characters from this ImageData chunk to locate its corresponding FileName tag
+            const searchWindowStart = Math.max(0, match.index - 5000);
+            const contextChunk = cwXmlText.substring(searchWindowStart, match.index);
+            
+            // Extract the closest matching file name from the context window
+            const nameMatch = contextChunk.match(/<[^:>]*?FileName>([^<]*?)<\/[^:>]*?FileName>/g);
+            let fileName = '';
+            
+            if (nameMatch && nameMatch.length > 0) {
+                // Grab the raw text value inside the last discovered FileName tag
+                const lastRawTag = nameMatch[nameMatch.length - 1];
+                fileName = lastRawTag.replace(/<[^>]*?>/g, '').trim();
+            }
 
-            const dataMatch = documentBlock.match(/<ImageData>(.*?)<\/ImageData>/);
-            if (!dataMatch) continue;
-            const base64Data = dataMatch[1];
+            // Fallback naming convention if parsing failed
+            if (!fileName) {
+                fileName = `CargoWise_Attachment_${fileIndex}_${cwKey}.pdf`;
+            }
+
+            fileIndex++;
 
             const sfPayload = {
                 Title: fileName,
@@ -125,13 +144,12 @@ export default async function handler(req, res) {
         }
 
         if (uploadPromises.length === 0) {
-            return res.status(404).json({ error: `No valid ImageData files discovered in CargoWise for shipment reference: ${cwKey}` });
+            return res.status(404).json({ error: `No valid ImageData files discovered in CargoWise payload for reference: ${cwKey}` });
         }
 
-        // --- 7. EXECUTE STREAM UPLOADS CONCURRENTLY TO SALESFORCE ---
+        // --- 7. CONCURRENTLY UPLOAD DATA STREAMS TO SALESFORCE ---
         const results = await Promise.all(uploadPromises);
 
-        // --- 8. RETURN BATCH RESPONSE TO LWC ---
         return res.status(201).json({ 
             success: true, 
             totalFilesProcessed: results.length,
